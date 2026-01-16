@@ -1,12 +1,16 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.autograd import Variable
-from functools import partial
 import numpy as np
-from model.cvae import ConditionalVAE
-from scipy.ndimage import gaussian_filter
+from functools import partial
+
 import einops
+from scipy.ndimage import gaussian_filter
+
+from transformers import LlamaModel, LlamaConfig
+
+from model.cvae import ConditionalVAE
+
 
 def conv3x3x3(in_planes, out_planes, stride=1, dilation=1):
     return nn.Conv3d(
@@ -16,19 +20,18 @@ def conv3x3x3(in_planes, out_planes, stride=1, dilation=1):
         dilation=dilation,
         stride=stride,
         padding=dilation,
-        bias=False)
+        bias=False,
+    )
 
 
 def downsample_basic_block(x, planes, stride):
     out = F.avg_pool3d(x, kernel_size=1, stride=stride)
-    zero_pads = torch.Tensor(
-        out.size(0), planes - out.size(1), out.size(2), out.size(3),
-        out.size(4)).zero_()
-    if isinstance(out.data, torch.cuda.FloatTensor):
-        zero_pads = zero_pads.cuda()
-
-    out = Variable(torch.cat([out.data, zero_pads], dim=1))
-
+    zero_pads = torch.zeros(
+        out.size(0), planes - out.size(1), out.size(2), out.size(3), out.size(4),
+        device=out.device,
+        dtype=out.dtype,
+    )
+    out = torch.cat([out, zero_pads], dim=1)
     return out
 
 
@@ -36,367 +39,312 @@ class Bottleneck(nn.Module):
     expansion = 4
 
     def __init__(self, inplanes, planes, stride=1, dilation=1, downsample=None):
-        super(Bottleneck, self).__init__()
+        super().__init__()
         self.conv1 = nn.Conv3d(inplanes, planes, kernel_size=1, bias=False)
         self.bn1 = nn.BatchNorm3d(planes)
         self.conv2 = nn.Conv3d(
-            planes, planes, kernel_size=3, stride=stride, dilation=dilation, padding=dilation, bias=False)
+            planes,
+            planes,
+            kernel_size=3,
+            stride=stride,
+            dilation=dilation,
+            padding=dilation,
+            bias=False,
+        )
         self.bn2 = nn.BatchNorm3d(planes)
         self.conv3 = nn.Conv3d(planes, planes * 4, kernel_size=1, bias=False)
         self.bn3 = nn.BatchNorm3d(planes * 4)
         self.relu = nn.ReLU(inplace=True)
         self.downsample = downsample
-        self.stride = stride
-        self.dilation = dilation
 
     def forward(self, x):
         residual = x
-
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        out = self.conv2(out)
-        out = self.bn2(out)
-        out = self.relu(out)
-
-        out = self.conv3(out)
-        out = self.bn3(out)
-
+        out = self.relu(self.bn1(self.conv1(x)))
+        out = self.relu(self.bn2(self.conv2(out)))
+        out = self.bn3(self.conv3(out))
         if self.downsample is not None:
             residual = self.downsample(x)
-
-        out += residual
-        out = self.relu(out)
-
+        out = self.relu(out + residual)
         return out
 
 
-class VITA(nn.Module):
-
-    def __init__(self,
-                 block = Bottleneck,
-                 layers = [3, 4, 23, 3],
-                 stem_features = 16,
-                 num_classes = 118,
-                 fpn_dim = 32,
-                 shortcut_type='B',
-                 text_features = None,
-                 image_shape=128,
-                 use_cas = False,
-                 **args):
-        self.stem_features = stem_features
-        self.use_cas = use_cas
-        self.image_shape = image_shape
-        self.do_vli = False
-        super(VITA, self).__init__()
-        self.conv1 = nn.Conv3d(
-            1,
-            stem_features,
-            kernel_size=7,
-            stride=2,
-            padding=(3, 3, 3),
-            bias=False)
-            
-        self.bn1 = nn.BatchNorm3d(stem_features)
-        self.relu = nn.ReLU(inplace=True)
-        self.layer1 = self._make_layer(block, stem_features, layers[0], shortcut_type)
-        self.layer2 = self._make_layer(
-            block, stem_features*2, layers[1], shortcut_type, stride=2)
-        self.layer3 = self._make_layer(
-            block, stem_features*4, layers[2], shortcut_type, stride=2, dilation=2)
-        self.layer4 = self._make_layer(
-            block, stem_features*8, layers[3], shortcut_type, stride=2, dilation=4)
-
-        input_shape = {}
-        for l in range(4):
-            scale_factor = 2**(l+1)
-            input_shape[f'p{l+2}'] = (self.stem_features//(2**(3-l)), tuple([image_shape//scale_factor]*3), scale_factor)
-
-
-        self.fpn = SemSegFPNHead(
-            input_shape, num_classes=fpn_dim, conv_dims=fpn_dim, common_stride=1, norm=nn.BatchNorm3d, conv_op=nn.Conv3d
-        )
-        if text_features is not None:
-            self.do_vli = True
-            self.text_features = text_features
-            self.logit_scale = nn.Parameter(torch.ones([]) * np.log(1 / 0.07))
-            self.text_projection = nn.Parameter(torch.empty(512, fpn_dim))
-            nn.init.normal_(self.text_projection, std=512 ** -0.5)
-        else:
-            self.seg_out = nn.Linear(fpn_dim, num_classes)
-            
-        if self.use_cas:
-            self.uncertain_ratio = args['uncertain_ratio']
-            self.over_sample_ratio = args['over_sample_ratio']
-            self.num_samples = int(image_shape ** 3 * args['sample_ratio'])
-            self.condition_phase = 'p2'
-            self.cvae = ConditionalVAE((1,(128,128,128),1), self.image_shape, latent_dim=32)
-
-        for m in self.modules():
-            if isinstance(m, nn.Conv3d):
-                m.weight = nn.init.kaiming_normal(m.weight, mode='fan_out')
-
-    def _make_layer(self, block, planes, blocks, shortcut_type, stride=1, dilation=1):
-        downsample = None
-        if stride != 1 or self.stem_features != planes * block.expansion:
-            if shortcut_type == 'A':
-                downsample = partial(
-                    downsample_basic_block,
-                    planes=planes * block.expansion,
-                    stride=stride)
-            else:
-                downsample = nn.Sequential(
-                    nn.Conv3d(
-                        self.stem_features,
-                        planes * block.expansion,
-                        kernel_size=1,
-                        stride=stride,
-                        bias=False), nn.BatchNorm3d(planes * block.expansion))
-
-        layers = []
-        layers.append(block(self.stem_features, planes, stride=stride, dilation=dilation, downsample=downsample))
-        self.stem_features = planes * block.expansion
-        for i in range(1, blocks):
-            layers.append(block(self.stem_features, planes, dilation=dilation))
-
-        return nn.Sequential(*layers)
-
-    def forward(self, input, mask=None, labels=None):
-        res = {}
-        x = self.conv1(input)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.layer1(x)
-        res['p2'] = x.clone()
-        x = self.layer2(x)
-        res['p3'] = x.clone()
-        x = self.layer3(x)
-        res['p4'] = x.clone()
-        x = self.layer4(x)
-        res['p5'] = x.clone()
-        x = self.fpn(res)
-
-        if self.training and self.use_cas:
-            sample_coor, uncertain_sample_coor, _ = self.sample_points(input.clone())
-            if labels is not None:
-                labels = point_sample(
-                    labels.unsqueeze(1).to(torch.float), sample_coor, mode="nearest", align_corners=False
-                    ).squeeze(1).to(torch.long)
-        else:
-            sample_coor = None
-        if self.do_vli:
-            x = self.constract_logit(x, sample_coor=sample_coor, mask_index=mask)
-        else:
-            if self.training and self.use_cas:
-                x = point_sample(x, sample_coor, align_corners=False).permute(0,2,1)
-                transposed = False
-            else:
-                x = x.permute(0,2,3,4,1)
-                transposed = True
-            x = self.seg_out(x)
-            if transposed:
-                x = x.permute(0,4,1,2,3)
-        
-        if self.use_cas:
-            if self.training:
-                kwargs = {}
-                point_indices, point_coords = get_uncertain_point_coords(
-                        calculate_uncertainty_with_gt(x.permute(0,2,1),labels), 
-                        (sample_coor.shape[1])//1, sample_coor=sample_coor, labels=labels)
-
-                gaussian = generate_gaussian(self.image_shape, point_coords).unsqueeze(1).to(input.device)
-
-                cvae_out = self.cvae(gaussian, input.clone())
-                kwargs['recon_loss'] = nn.functional.mse_loss(cvae_out[0], cvae_out[1])
-                mu, log_var = cvae_out[2].flatten(start_dim=1), cvae_out[3].flatten(start_dim=1)
-                kwargs['kld_loss'] = torch.mean(-0.5 * torch.sum(1 + log_var - mu ** 2 - log_var.exp(), dim = 1), dim = 0)
-                kwargs['sample_coor'] = sample_coor  
-                kwargs['point_coords'] = point_coords  
-                kwargs['uncertain_sample_coor'] = uncertain_sample_coor
-                return x, labels, kwargs
-
-        return x
-
-    def constract_logit(self, x, u=0, sample_coor=None, mask_index=None):
-        B, C, D, H, W = x.shape
-        text_features = self.text_features.squeeze(dim=1) @ self.text_projection
-        text_features = text_features / text_features.norm(dim=1, keepdim=True)
-        if sample_coor is not None:
-            image_features = point_sample(x, sample_coor, align_corners=False).permute(0,2,1)
-        else:
-            image_features = x.permute(0,2,3,4,1).contiguous().view(B*D*H*W, C)
-        image_features = image_features / image_features.norm(dim=-1, keepdim=True)
-        if mask_index is not None and sample_coor is None:
-            image_features = image_features.gather(dim=0, index=mask_index.repeat(1,C))
-        
-        logit_scale = self.logit_scale.exp()
-        logits_per_image = logit_scale * image_features @ text_features.t()
-
-        if sample_coor is None and mask_index is None:
-            logits_per_image = logits_per_image.view(B, D, H, W, -1).permute(0,4,1,2,3)
-        return logits_per_image
-
-    def sample_points(self, condition):
-        num_samples = int(self.num_samples * self.over_sample_ratio)
-        num_uncertain_points = int(self.uncertain_ratio * num_samples)
-        num_random_points = num_samples - num_uncertain_points
-        if num_uncertain_points > 0:
-            gaussian = self.cvae.sample(condition.shape[0], condition)
-
-            mask = torch.zeros_like(gaussian)
-            mask[:,:,2:-2,2:-2,2:-2] = gaussian[:,:,2:-2,2:-2,2:-2]
-            gaussian = mask
-            _, uncertain_sample_coor = get_uncertain_point_coords_on_grid(gaussian, num_uncertain_points)
-        else:
-            uncertain_sample_coor = None
-
-        if num_random_points > 0 and num_uncertain_points > 0:
-            sample_coor = torch.cat(
-                [uncertain_sample_coor, torch.rand(condition.shape[0], num_random_points, 3, device=condition.device)],
-                dim=1,
-            )
-        elif num_random_points > 0 and num_uncertain_points == 0:
-            sample_coor = torch.rand(condition.shape[0], num_random_points, 3, device=condition.device)
-        elif num_random_points == 0 and num_uncertain_points > 0:
-            sample_coor = uncertain_sample_coor
-        return sample_coor, uncertain_sample_coor, gaussian
-
-    def adjust_coor_on_grid(self, point_coor):
-        """ adjust coordination onto grid so sampling will not need to interpolate """
-        voxel_step = 1.0 / self.image_shape
-        grid_coor = torch.clip(torch.round(point_coor * self.image_shape - 0.5),min=0,max=(self.image_shape-1)) + 0.5
-        return voxel_step * grid_coor
-
-
 class SemSegFPNHead(nn.Module):
-    """
-    A semantic segmentation head described in :paper:`PanopticFPN`
-    """
-
     def __init__(
         self,
         input_shape,
         *,
-        num_classes: int,
+        out_channels: int,
         conv_dims: int,
         common_stride: int,
-        loss_weight: float = 1.0,
-        norm = None,
-        conv_op = None,
-        ignore_value: int = -1,
+        norm=nn.BatchNorm3d,
+        conv_op=nn.Conv3d,
     ):
         super().__init__()
-        input_shape = input_shape.items()
-        if not len(input_shape):
+        input_shape = list(input_shape.items())
+        if not input_shape:
             raise ValueError("SemSegFPNHead(input_shape=) cannot be empty!")
-        self.in_features = [k for k, v in input_shape]
-        feature_strides = [v[-1] for k, v in input_shape]
-        feature_channels = [v[0] for k, v in input_shape]
 
-        self.ignore_value = ignore_value
+        self.in_features = [k for k, _ in input_shape]
+        feature_strides = [v[-1] for _, v in input_shape]
+        feature_channels = [v[0] for _, v in input_shape]
         self.common_stride = common_stride
-        self.loss_weight = loss_weight
 
-        self.scale_heads = []
-        for in_feature, stride, channels in zip(
-            self.in_features, feature_strides, feature_channels
-        ):
+        self.scale_heads = nn.ModuleList()
+        for stride, channels in zip(feature_strides, feature_channels):
             head_ops = []
             head_length = max(1, int(np.log2(stride) - np.log2(self.common_stride)))
             for k in range(head_length):
-                norm_module = norm(conv_dims)
-                conv = conv_op(
-                    channels if k == 0 else conv_dims,
-                    conv_dims,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                    bias=not norm,
-                )
-                
-                head_ops.append(nn.Sequential(conv,norm_module,nn.ReLU()))
-                if stride != self.common_stride:
-                    head_ops.append(
-                        nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False)
+                head_ops.append(
+                    nn.Sequential(
+                        conv_op(
+                            channels if k == 0 else conv_dims,
+                            conv_dims,
+                            kernel_size=3,
+                            stride=1,
+                            padding=1,
+                            bias=False,
+                        ),
+                        norm(conv_dims),
+                        nn.ReLU(inplace=True),
                     )
+                )
+                if stride != self.common_stride:
+                    head_ops.append(nn.Upsample(scale_factor=2, mode="trilinear", align_corners=False))
             self.scale_heads.append(nn.Sequential(*head_ops))
-            self.add_module(in_feature, self.scale_heads[-1])
-        self.predictor = conv_op(conv_dims*len(self.in_features), num_classes, kernel_size=1, stride=1, padding=0)    # conv_dims*len(self.in_features)
 
-    def forward(self, features, targets=None):
-        res = []
-        for i, f in enumerate(self.in_features):
-            res.append(self.scale_heads[i](features[f]))
-        res = torch.cat(res,dim=1)
-        res = self.predictor(res)
-        return res
+        self.predictor = conv_op(conv_dims * len(self.in_features), out_channels, kernel_size=1, stride=1, padding=0)
 
-def generate_gaussian(image_shape, sample_coor, visualize=False):
-    B, N, _ = sample_coor.shape
-    sample_coor = torch.clip(torch.round(sample_coor * image_shape - 0.5),min=0,max=(image_shape-1)).long()
-    shift = torch.arange(B, dtype=torch.long, device=sample_coor.device).unsqueeze(1).unsqueeze(1).repeat(1, N, 1)
-    sample_coor = einops.rearrange(torch.cat([shift, sample_coor],dim=-1),'b n c -> c (b n)')
+    def forward(self, features):
+        outs = []
+        for f_name, head in zip(self.in_features, self.scale_heads):
+            outs.append(head(features[f_name]))
+        x = torch.cat(outs, dim=1)
+        x = self.predictor(x)
+        return x
 
-    step = 1./float(N)
-    upper, lower = 1.0, 0.0
-    gaussian_sigma = 1.0
-    gaussian = torch.zeros((B, image_shape, image_shape, image_shape)).float().index_put(tuple(sample_coor),(torch.arange(upper, lower, -((upper-lower)*step))).repeat(B))
 
-    gaussian = torch.from_numpy(gaussian_filter(gaussian, [0, gaussian_sigma, gaussian_sigma, gaussian_sigma], 0, mode='constant', cval=0))
-    return gaussian
+class LlamaTextProjector(nn.Module):
+    def __init__(self, llama_model, out_dim: int):
+        super().__init__()
+        self.llama = llama_model
+        hidden = self.llama.config.hidden_size
+        self.proj = nn.Linear(hidden, out_dim, bias=False)
 
-def calculate_uncertainty_with_gt(logits, classes):
-    if logits.shape[1] == 1:
-        gt_class_logits = logits.clone()
-    else:
-        gt_class_logits = logits.gather(dim=1,index=classes.unsqueeze(1))
-    return -(torch.abs(gt_class_logits))
+    def forward(self, input_ids, attention_mask):
+        out = self.llama(input_ids=input_ids, attention_mask=attention_mask, return_dict=True)
+        hs = out.last_hidden_state
+        mask = attention_mask.unsqueeze(-1).to(hs.dtype)
+        pooled = (hs * mask).sum(dim=1) / mask.sum(dim=1).clamp_min(1.0)
+        emb = self.proj(pooled)
+        emb = emb / emb.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        return emb
 
-def get_uncertain_point_coords_on_grid(uncertainty_map, num_points):
-    B, _, D, H, W = uncertainty_map.shape
-    d_step = 1.0 / float(D)
-    h_step = 1.0 / float(H)
-    w_step = 1.0 / float(W)
-
-    num_points = min(D * H * W, num_points)
-    point_indices = torch.topk(uncertainty_map.view(B, D * H * W), k=num_points, dim=1)[1]
-    point_coords = torch.zeros(B, num_points, 3, dtype=torch.float, device=uncertainty_map.device)
-    point_coords[:, :, 0] = d_step / 2.0 + torch.div(point_indices, (W*H), rounding_mode='trunc').to(torch.float) * w_step
-    point_coords[:, :, 1] = h_step / 2.0 + torch.div(point_indices %(W*H), W, rounding_mode='trunc').to(torch.float) * h_step
-    point_coords[:, :, 2] = w_step / 2.0 + (point_indices %(H*W)%W).to(torch.float) * w_step
-    return point_indices, point_coords
-
-def get_uncertain_point_coords(uncertainty_map, num_points, sample_coor, labels):
-    B, _, K = uncertainty_map.shape
-    num_points = min(K, num_points)
-    allcase = []
-    for idx in range(B):
-        foreground_index = torch.arange(labels.shape[-1],device=labels.device)[labels[idx]!=0]
-        background_index = torch.arange(labels.shape[-1],device=labels.device)[labels[idx]==0]
-        fg_numpoint = min(foreground_index.shape[-1], num_points)
-        bg_numpoint = min(background_index.shape[-1], (num_points - fg_numpoint))
-
-        foreground_map = uncertainty_map[idx].view(K).gather(dim=0,index=foreground_index)
-        map_indices = torch.topk(foreground_map, k=fg_numpoint)[1]
-        point_indices = foreground_index[map_indices]
-        
-        if bg_numpoint > 0:
-            background_map = uncertainty_map[idx].view(K).gather(dim=0,index=background_index)
-            bg_map_indices = torch.topk(background_map, k=bg_numpoint)[1]
-            point_indices = torch.cat([point_indices, background_index[bg_map_indices]], dim=0)
-            map_indices = torch.cat([map_indices, bg_map_indices], dim=0)
-        allcase.append(point_indices)
-    point_indices = torch.stack(allcase, dim=0)
-    point_coords = sample_coor.gather(dim=1,index=point_indices.unsqueeze(-1).expand(-1,-1,3))
-    return point_indices, point_coords
 
 def point_sample(input, point_coords, **kwargs):
     add_dim = False
     if point_coords.dim() == 3:
         add_dim = True
         point_coords = point_coords.unsqueeze(2).unsqueeze(2)
-    output = F.grid_sample(input, 2.0 * point_coords - 1.0, **kwargs)
+    out = F.grid_sample(input, 2.0 * point_coords - 1.0, **kwargs)
     if add_dim:
-        output = output.squeeze(3).squeeze(3)
-    return output
+        out = out.squeeze(3).squeeze(3)
+    return out
+
+
+def get_uncertain_point_coords_on_grid(score_map, num_points):
+    B, _, D, H, W = score_map.shape
+    num_points = min(D * H * W, num_points)
+
+    flat = score_map.view(B, D * H * W)
+    point_indices = torch.topk(flat, k=num_points, dim=1)[1]
+
+    d_step = 1.0 / float(D)
+    h_step = 1.0 / float(H)
+    w_step = 1.0 / float(W)
+
+    d_idx = torch.div(point_indices, H * W, rounding_mode="trunc")
+    rem = point_indices % (H * W)
+    h_idx = torch.div(rem, W, rounding_mode="trunc")
+    w_idx = rem % W
+
+    coords = torch.zeros(B, num_points, 3, device=score_map.device, dtype=torch.float)
+    coords[:, :, 0] = d_step * (d_idx.to(torch.float) + 0.5)
+    coords[:, :, 1] = h_step * (h_idx.to(torch.float) + 0.5)
+    coords[:, :, 2] = w_step * (w_idx.to(torch.float) + 0.5)
+    return point_indices, coords
+
+
+def generate_gaussian(image_shape, sample_coor):
+    B, N, _ = sample_coor.shape
+    vox = torch.clip(torch.round(sample_coor * image_shape - 0.5), min=0, max=(image_shape - 1)).long()
+
+    shift = torch.arange(B, device=vox.device).view(B, 1, 1).repeat(1, N, 1)
+    idx = einops.rearrange(torch.cat([shift, vox], dim=-1), "b n c -> c (b n)")
+
+    step = 1.0 / float(max(N, 1))
+    upper, lower = 1.0, 0.0
+    values = (torch.arange(upper, lower, -((upper - lower) * step), device=vox.device, dtype=torch.float)).repeat(B)
+
+    heat = torch.zeros((B, image_shape, image_shape, image_shape), device=vox.device, dtype=torch.float)
+    heat = heat.index_put(tuple(idx), values)
+
+    heat = torch.from_numpy(gaussian_filter(heat.detach().cpu().numpy(), [0, 1.0, 1.0, 1.0], 0, mode="constant", cval=0))
+    return heat.to(vox.device)
+
+
+def compute_complexity_heatmap_from_logits(logits, gt_labels, num_classes: int):
+    p = F.softmax(logits, dim=1)
+    y = F.one_hot(gt_labels.long(), num_classes=num_classes).permute(0, 4, 1, 2, 3).to(p.dtype)
+    E = ((p - y) ** 2).mean(dim=1, keepdim=True)
+    Emin = E.flatten(1).min(dim=1)[0].view(-1, 1, 1, 1, 1)
+    Emax = E.flatten(1).max(dim=1)[0].view(-1, 1, 1, 1, 1)
+    H = (E - Emin) / (Emax - Emin + 1e-6)
+    return H
+
+
+class VITA(nn.Module):
+    def __init__(
+        self,
+        block=Bottleneck,
+        layers=(3, 4, 23, 3),
+        stem_features=16,
+        num_classes=118,
+        fpn_dim=32,
+        image_shape=128,
+        use_cas=False,
+        sample_ratio=0.02,
+        topk_ratio=0.5,
+        llama_model=None,
+        llama_config=None,
+        llama_pretrained=None,
+    ):
+        super().__init__()
+        self.num_classes = num_classes
+        self.image_shape = image_shape
+        self.use_cas = use_cas
+
+        self._inplanes = stem_features
+        self.conv1 = nn.Conv3d(1, stem_features, kernel_size=7, stride=2, padding=3, bias=False)
+        self.bn1 = nn.BatchNorm3d(stem_features)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.layer1 = self._make_layer(block, stem_features, layers[0], stride=1)
+        self.layer2 = self._make_layer(block, stem_features * 2, layers[1], stride=2)
+        self.layer3 = self._make_layer(block, stem_features * 4, layers[2], stride=2, dilation=2)
+        self.layer4 = self._make_layer(block, stem_features * 8, layers[3], stride=2, dilation=4)
+
+        p2_c = stem_features * 4
+        p3_c = stem_features * 8
+        p4_c = stem_features * 16
+        p5_c = stem_features * 32
+
+        input_shape = {}
+        input_shape["p2"] = (p2_c, (image_shape // 2, image_shape // 2, image_shape // 2), 2)
+        input_shape["p3"] = (p3_c, (image_shape // 4, image_shape // 4, image_shape // 4), 4)
+        input_shape["p4"] = (p4_c, (image_shape // 8, image_shape // 8, image_shape // 8), 8)
+        input_shape["p5"] = (p5_c, (image_shape // 16, image_shape // 16, image_shape // 16), 16)
+
+        self.fpn = SemSegFPNHead(
+            input_shape,
+            out_channels=fpn_dim,
+            conv_dims=fpn_dim,
+            common_stride=1,
+            norm=nn.BatchNorm3d,
+            conv_op=nn.Conv3d,
+        )
+
+        if llama_model is None:
+            if llama_pretrained is not None:
+                llama_model = LlamaModel.from_pretrained(llama_pretrained)
+            else:
+                if llama_config is None:
+                    llama_config = LlamaConfig()
+                llama_model = LlamaModel(llama_config)
+
+        self.text_encoder = LlamaTextProjector(llama_model, out_dim=fpn_dim)
+
+        self.num_samples = int((image_shape ** 3) * float(sample_ratio))
+        self.topk_ratio = float(topk_ratio)
+
+        if self.use_cas:
+            self.cvae = ConditionalVAE(in_channels_x=1, image_shape=image_shape, latent_dim=32)
+
+        for m in self.modules():
+            if isinstance(m, nn.Conv3d) or isinstance(m, nn.ConvTranspose3d):
+                nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
+
+    def _make_layer(self, block, planes, blocks, stride=1, dilation=1, shortcut_type="B"):
+        downsample = None
+        if stride != 1 or self._inplanes != planes * block.expansion:
+            if shortcut_type == "A":
+                downsample = partial(downsample_basic_block, planes=planes * block.expansion, stride=stride)
+            else:
+                downsample = nn.Sequential(
+                    nn.Conv3d(self._inplanes, planes * block.expansion, kernel_size=1, stride=stride, bias=False),
+                    nn.BatchNorm3d(planes * block.expansion),
+                )
+
+        layers = [block(self._inplanes, planes, stride=stride, dilation=dilation, downsample=downsample)]
+        self._inplanes = planes * block.expansion
+        for _ in range(1, blocks):
+            layers.append(block(self._inplanes, planes, stride=1, dilation=dilation))
+        return nn.Sequential(*layers)
+
+    def voxel_context_fusion(self, voxel_feats, class_text_embeds, sample_coords=None):
+        B, d, D, H, W = voxel_feats.shape
+
+        if sample_coords is not None:
+            v = point_sample(voxel_feats, sample_coords, align_corners=False).permute(0, 2, 1)
+            v = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            logits = torch.matmul(v, class_text_embeds.t())
+            return logits
+
+        v = voxel_feats.permute(0, 2, 3, 4, 1).reshape(-1, d)
+        v = v / v.norm(dim=-1, keepdim=True).clamp_min(1e-6)
+        logits = torch.matmul(v, class_text_embeds.t())
+        logits = logits.view(B, D, H, W, -1).permute(0, 4, 1, 2, 3)
+        return logits
+
+    def forward(self, x, class_text_inputs, gt_labels=None):
+        feats = {}
+        y = self.relu(self.bn1(self.conv1(x)))
+        y = self.layer1(y); feats["p2"] = y
+        y = self.layer2(y); feats["p3"] = y
+        y = self.layer3(y); feats["p4"] = y
+        y = self.layer4(y); feats["p5"] = y
+
+        voxel_feats = self.fpn(feats)
+
+        class_embeds = self.text_encoder(
+            class_text_inputs["input_ids"].to(x.device),
+            class_text_inputs["attention_mask"].to(x.device),
+        )
+
+        extras = {}
+        sample_coords = None
+
+        if self.training and self.use_cas:
+            if gt_labels is None:
+                raise ValueError("gt_labels is required during training when use_cas=True.")
+
+            full_logits = self.voxel_context_fusion(voxel_feats, class_embeds, sample_coords=None)
+            H = compute_complexity_heatmap_from_logits(full_logits, gt_labels, num_classes=self.num_classes)
+            H_hat, mu, log_var = self.cvae(x, H)
+
+            k = max(1, int(self.num_samples * self.topk_ratio))
+            _, hard_coords = get_uncertain_point_coords_on_grid(H_hat, k)
+
+            r = max(0, self.num_samples - k)
+            if r > 0:
+                rand_coords = torch.rand((x.shape[0], r, 3), device=x.device)
+                sample_coords = torch.cat([hard_coords, rand_coords], dim=1)
+            else:
+                sample_coords = hard_coords
+
+            extras.update({"H": H, "H_hat": H_hat, "mu": mu, "log_var": log_var, "sample_coords": sample_coords})
+
+            sampled_logits = self.voxel_context_fusion(voxel_feats, class_embeds, sample_coords=sample_coords)
+            return sampled_logits, extras
+
+        logits = self.voxel_context_fusion(voxel_feats, class_embeds, sample_coords=None)
+        return logits, extras

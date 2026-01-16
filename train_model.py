@@ -44,9 +44,9 @@ def save_checkpoint(state, save_path):
     if not os.path.isdir(save_path):
         os.makedirs(save_path)
 
-    epoch = state['epoch']  # epoch no
-    best_model = state['best_model']  # bool
-    model = state['model']  # model type
+    epoch = state['epoch']  
+    best_model = state['best_model']  
+    model = state['model']  
 
     if best_model:
         filename = save_path + '/' + \
@@ -61,11 +61,7 @@ def worker_init_fn(worker_id):
     random.seed(config.seed + worker_id)
 
 
-##################################################################################
-# =================================================================================
-#          Main Loop: load model,
-# =================================================================================
-##################################################################################
+
 def main_loop(batch_size=config.batch_size, model_type='', tensorboard=True):
     # Load train and val data
     train_tf = transforms.Compose([RandomGenerator(output_size=[config.img_size, config.img_size])])
@@ -100,32 +96,44 @@ def main_loop(batch_size=config.batch_size, model_type='', tensorboard=True):
                              
     lr = config.learning_rate
     logger.info(model_type)
-
     if model_type == 'VITA':
         config_vit = config.get_CTranS_config()
         logger.info('transformer head num: {}'.format(config_vit.transformer.num_heads))
         logger.info('transformer layers num: {}'.format(config_vit.transformer.num_layers))
         logger.info('transformer expand ratio: {}'.format(config_vit.expand_ratio))
-        model = VITA(config_vit, n_channels=config.n_channels, n_classes=config.n_labels)
 
-    elif model_type == 'VITA':
-        config_vit = config.get_CTranS_config()
-        logger.info('transformer head num: {}'.format(config_vit.transformer.num_heads))
-        logger.info('transformer layers num: {}'.format(config_vit.transformer.num_layers))
-        logger.info('transformer expand ratio: {}'.format(config_vit.expand_ratio))
-        model = VITA(config_vit, n_channels=config.n_channels, n_classes=config.n_labels)
-        pretrained_UNet_model_path = "MoNuSeg/VITA/Test_session_05.23_10h55/models/best_model-VITA.pth.tar"
-        pretrained_UNet = torch.load(pretrained_UNet_model_path, map_location='cuda')
-        pretrained_UNet = pretrained_UNet['state_dict']
-        model2_dict = model.state_dict()
-        state_dict = {k: v for k, v in pretrained_UNet.items() if k in model2_dict.keys()}
-        print(state_dict.keys())
-        model2_dict.update(state_dict)
-        model.load_state_dict(model2_dict)
-        logger.info('Load successful!')
+        model = VITA(
+            config_vit,
+            n_channels=config.n_channels,
+            n_classes=config.n_labels
+        )
+
+        if config.pretrain:
+            pretrained_path = "MoNuSeg/VITA/Test_session_05.23_10h55/models/best_model-VITA.pth.tar"
+            logger.info(f"Loading pretrained model from {pretrained_path}")
+
+            checkpoint = torch.load(pretrained_path, map_location='cuda')
+
+            if 'state_dict' in checkpoint:
+                pretrained_state = checkpoint['state_dict']
+            else:
+                pretrained_state = checkpoint
+
+            model_state = model.state_dict()
+
+            compatible_state = {
+                k: v for k, v in pretrained_state.items()
+                if k in model_state and model_state[k].shape == v.shape
+            }
+
+            model_state.update(compatible_state)
+            model.load_state_dict(model_state)
+
+            logger.info(f"Loaded {len(compatible_state)} layers from pretrained model")
 
     else:
         raise TypeError('Please enter a valid name for the model type')
+
     input = torch.randn(2, 3, 224, 224)
     text = torch.randn(2, 10, 768)
     flops, params = profile(model, inputs=(input, text, ))
@@ -152,23 +160,21 @@ def main_loop(batch_size=config.batch_size, model_type='', tensorboard=True):
 
     max_dice = 0.0
     best_epoch = 1
-    for epoch in range(config.epochs):  # loop over the dataset multiple times
+    for epoch in range(config.epochs):  
         logger.info('\n========= Epoch [{}/{}] ========='.format(epoch + 1, config.epochs + 1))
         logger.info(config.session_name)
-        # train for one epoch
+        
         model.train(True)
         logger.info('Training with batch size : {}'.format(batch_size))
         train_one_epoch(train_loader, model, criterion, optimizer, writer, epoch, None, model_type, logger)  # sup
 
-        # evaluate on validation set
+       
         logger.info('Validation')
         with torch.no_grad():
             model.eval()
             val_loss, val_dice = train_one_epoch(val_loader, model, criterion,
                                                  optimizer, writer, epoch, lr_scheduler, model_type, logger)
-        # =============================================================
-        #       Save best model
-        # =============================================================
+
         if val_dice > max_dice:
             if True:
                 logger.info(
